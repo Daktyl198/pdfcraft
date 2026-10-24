@@ -873,19 +873,18 @@ impl crate::PdfCraftApp {
     }
 
     /// Place the copied image files on the current page, each as Add Image places one (so
-    /// several lie one over the other, the last one selected). Files that aren't pictures (PDFs,
-    /// documents) are left alone, folders quietly; when nothing could be placed, a notice says so.
+    /// several lie one over the other, the last one selected). Copied files that aren't pictures
+    /// (PDFs, documents, folders) are left alone; when nothing could be placed and no file said
+    /// why, a notice says so.
     #[cfg(not(target_arch = "wasm32"))]
     fn paste_image_files(&mut self, paths: &[std::path::PathBuf]) {
-        let files: Vec<_> = paths.iter().filter(|p| p.is_absolute() && !p.is_dir()).collect();
+        let files: Vec<_> = paths.iter().filter(|p| p.is_absolute()).collect();
         if files.len() > MAX_PASTED_IMAGES {
             self.notify_fmt("Only the first {n} copied files are pasted", &[("n", &MAX_PASTED_IMAGES.to_string())]);
         }
-        let mut not_pictures = 0usize;
-        let mut placed = 0usize;
+        let (mut placed, mut failed) = (0usize, false);
         for path in files.into_iter().take(MAX_PASTED_IMAGES) {
-            if !is_image_file_name(path) {
-                not_pictures += 1;
+            if !is_image_file_name(path) || path.is_dir() {
                 continue;
             }
             let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -897,14 +896,21 @@ impl crate::PdfCraftApp {
                     }
                     placed += 1;
                 }
-                Ok(None) => self.notify_fmt(
-                    "{name} is too large to paste (at most {n} MB)",
-                    &[("name", &name), ("n", &(MAX_PASTED_IMAGE_BYTES >> 20).to_string())],
-                ),
-                Err(e) => self.notify_fmt("Couldn't read {name}: {e}", &[("name", &path.display().to_string()), ("e", &e.to_string())]),
+                Ok(None) => {
+                    failed = true;
+                    self.notify_fmt(
+                        "{name} is too large to paste (at most {n} MB)",
+                        &[("name", &name), ("n", &(MAX_PASTED_IMAGE_BYTES >> 20).to_string())],
+                    );
+                }
+                Err(e) => {
+                    failed = true;
+                    self.notify_fmt("Couldn't read {name}: {e}", &[("name", &path.display().to_string()), ("e", &e.to_string())]);
+                }
             }
         }
-        if placed == 0 && not_pictures > 0 {
+        // A file that couldn't be read has said so; this notice would hide it.
+        if placed == 0 && !failed {
             self.notify_tr("None of the copied files is a picture to place (PNG, JPEG, TIFF, GIF, BMP or JPEG 2000)");
         }
     }
@@ -918,12 +924,23 @@ const MAX_PASTED_IMAGES: usize = 50;
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_PASTED_IMAGE_BYTES: u64 = 256 << 20;
 
-/// The file at `path`, or `None` when it holds more than `cap` bytes.
+/// The regular file at `path`, or `None` when it holds more than `cap` bytes. Anything else
+/// (a named pipe or a device, which a file list can name too) is refused before it is opened,
+/// because opening one waits on the UI thread until something writes to it.
 #[cfg(not(target_arch = "wasm32"))]
 fn read_capped(path: &std::path::Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
+    let not_a_file = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "it isn't a regular file");
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(not_a_file());
+    }
+    let file = std::fs::File::open(path)?;
+    // Swapped for something else since the check: still refused before anything is read.
+    if !file.metadata()?.is_file() {
+        return Err(not_a_file());
+    }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    file.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= cap).then_some(bytes))
 }
 
@@ -1037,6 +1054,30 @@ mod tests {
         assert_eq!(read_capped(&path, 10).unwrap(), Some(vec![7u8; 10]));
         assert_eq!(read_capped(&path, 9).unwrap(), None);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A named pipe called like a picture is refused without opening it, which would wait for a
+    /// writer forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_pasted_named_pipe_is_refused_without_waiting() {
+        let dir = std::env::temp_dir().join(format!("pdfcraft-read-fifo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("photo.png");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_capped(&path, 10).map_err(|e| e.kind()));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+        // Let a reader that did block go: open the pipe for writing once.
+        if result.is_err() {
+            let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result.expect("the read returns at once"), Err(std::io::ErrorKind::InvalidInput));
     }
 
     /// The image a flip button leaves behind, as the panel returns it.

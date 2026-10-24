@@ -374,8 +374,11 @@ fn image_files_on_the_clipboard_are_pasted_onto_the_page() {
     assert!(added(&h).is_empty());
     assert_eq!(h.state().views.len(), 1, "nothing opens");
     assert!(toast(&h).starts_with("None of the copied files is a picture"), "{}", toast(&h));
-    // A copied file that is gone says so.
-    paste(&mut h, &["missing.png"]);
+    // So do folders alone.
+    paste(&mut h, &["folder.png"]);
+    assert!(toast(&h).starts_with("None of the copied files is a picture"), "{}", toast(&h));
+    // A copied file that is gone says so, and that isn't hidden by the PDF beside it.
+    paste(&mut h, &["notes.pdf", "missing.png"]);
     assert!(added(&h).is_empty());
     assert!(toast(&h).starts_with("Couldn't read"), "{}", toast(&h));
     paste(&mut h, &["notes.pdf", "Copied.PNG"]);
