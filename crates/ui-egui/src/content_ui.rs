@@ -662,9 +662,7 @@ impl crate::PdfCraftApp {
             Some(p) if p.ends_with(".png") || p.ends_with(".jpg") => read(self, p.into()),
             Some(_) => {}
             None => {
-                let dialog = rfd::AsyncFileDialog::new()
-                    .add_filter(tl!("Images"), &["png", "jpg", "jpeg", "tif", "tiff", "gif", "bmp", "jp2", "j2k", "jpx"])
-                    .set_title(title);
+                let dialog = rfd::AsyncFileDialog::new().add_filter(tl!("Images"), &IMAGE_EXTENSIONS).set_title(title);
                 let target = self.active_ids().map(|(_, id)| id);
                 self.ask_one(crate::pickers::Ask::File(dialog), target, read);
             }
@@ -674,7 +672,9 @@ impl crate::PdfCraftApp {
     /// Edit a PDF ▸ Add content ▸ Image: pick a file and place it in the middle of the current page.
     pub fn add_image_dialog(&mut self) {
         #[cfg(not(target_arch = "wasm32"))]
-        self.pick_image(tl!("Choose an image"), |app, name, bytes| app.add_image(name, bytes));
+        self.pick_image(tl!("Choose an image"), |app, name, bytes| {
+            app.add_image(name, bytes);
+        });
         #[cfg(target_arch = "wasm32")]
         self.notify_tr("Adding images arrives on the web with file pickers for images");
     }
@@ -810,16 +810,19 @@ impl crate::PdfCraftApp {
         }
     }
 
-    /// Place image `bytes` in the middle of the current page and select it.
-    pub fn add_image(&mut self, name: String, bytes: Vec<u8>) {
-        let Some((i, id)) = self.active_ids() else { return };
+    /// Place image `bytes` in the middle of the current page and select it. Returns whether it
+    /// was placed (a failure has been said).
+    pub fn add_image(&mut self, name: String, bytes: Vec<u8>) -> bool {
+        let Some((i, id)) = self.active_ids() else { return false };
         let page = self.views[i].current;
         let before = self.session.get(id).map_or(0, |d| d.added().iter().filter(|a| a.page == page).count());
-        if self.apply_edit(Edit::AddImage { page, rect: None, name, bytes: std::sync::Arc::new(bytes) }) {
+        let placed = self.apply_edit(Edit::AddImage { page, rect: None, name, bytes: std::sync::Arc::new(bytes) });
+        if placed {
             self.views[i].content.select_added = Some((page, before));
             self.left = crate::LeftPanel::Tool("edit");
             self.left_open = true;
         }
+        placed
     }
 
     /// Whether ⌘V / Ctrl+V was let go this frame. egui-winit swallows that press (with a Paste
@@ -840,7 +843,9 @@ impl crate::PdfCraftApp {
     }
 
     /// ⌘V / Ctrl+V with a picture on the system clipboard (a screenshot, a picture copied in a
-    /// browser) places it on the current page, as Add Image does.
+    /// browser) places it on the current page, as Add Image does. So do image files copied in
+    /// Explorer, Finder or a file manager (#1289), each in its own format; the clipboard's file
+    /// list comes first, because Finder puts the file's icon beside it as a picture.
     /// Organize Pages keeps ⌘V for pages, Prepare Form for fields, and text fields for text.
     pub(crate) fn paste_image_key(&mut self, i: usize, ctx: &egui::Context, pasted: bool) {
         let free = self.dialog.is_none() && !self.palette_open && !ctx.egui_wants_keyboard_input();
@@ -851,15 +856,93 @@ impl crate::PdfCraftApp {
         let clip = match self.clipboard_override.clone() {
             Some(c) => Some(c),
             #[cfg(not(target_arch = "wasm32"))]
-            None if self.system_clipboard => crate::create_ui::read_clipboard(),
+            None if self.system_clipboard => clipboard_picture(crate::create_ui::read_clipboard_files(), crate::create_ui::read_clipboard),
             None => None,
         };
-        let Some(crate::create_ui::Clip::Image { width, height, rgba }) = clip else { return };
-        match crate::create_ui::png_from_rgba(width, height, &rgba) {
-            Ok(png) => self.add_image("Pasted image.png".into(), png),
-            Err(e) => self.notify_fmt("Couldn't read {name}: {e}", &[("name", tl!("Clipboard")), ("e", &e)]),
+        match clip {
+            Some(crate::create_ui::Clip::Image { width, height, rgba }) => match crate::create_ui::png_from_rgba(width, height, &rgba) {
+                Ok(png) => {
+                    self.add_image("Pasted image.png".into(), png);
+                }
+                Err(e) => self.notify_fmt("Couldn't read {name}: {e}", &[("name", tl!("Clipboard")), ("e", &e)]),
+            },
+            #[cfg(not(target_arch = "wasm32"))]
+            Some(crate::create_ui::Clip::Files(paths)) => self.paste_image_files(&paths),
+            _ => {}
         }
     }
+
+    /// Place the copied image files on the current page, each as Add Image places one (so
+    /// several lie one over the other, the last one selected). Files that aren't pictures (PDFs,
+    /// documents) are left alone, folders quietly; when nothing could be placed, a notice says so.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn paste_image_files(&mut self, paths: &[std::path::PathBuf]) {
+        let files: Vec<_> = paths.iter().filter(|p| p.is_absolute() && !p.is_dir()).collect();
+        if files.len() > MAX_PASTED_IMAGES {
+            self.notify_fmt("Only the first {n} copied files are pasted", &[("n", &MAX_PASTED_IMAGES.to_string())]);
+        }
+        let mut not_pictures = 0usize;
+        let mut placed = 0usize;
+        for path in files.into_iter().take(MAX_PASTED_IMAGES) {
+            if !is_image_file_name(path) {
+                not_pictures += 1;
+                continue;
+            }
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            match read_capped(path, MAX_PASTED_IMAGE_BYTES) {
+                Ok(Some(bytes)) => {
+                    // A document that can't take it says so once, not once per file.
+                    if !self.add_image(name, bytes) {
+                        return;
+                    }
+                    placed += 1;
+                }
+                Ok(None) => self.notify_fmt(
+                    "{name} is too large to paste (at most {n} MB)",
+                    &[("name", &name), ("n", &(MAX_PASTED_IMAGE_BYTES >> 20).to_string())],
+                ),
+                Err(e) => self.notify_fmt("Couldn't read {name}: {e}", &[("name", &path.display().to_string()), ("e", &e.to_string())]),
+            }
+        }
+        if placed == 0 && not_pictures > 0 {
+            self.notify_tr("None of the copied files is a picture to place (PNG, JPEG, TIFF, GIF, BMP or JPEG 2000)");
+        }
+    }
+}
+
+/// At most this many copied files are pasted at once.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PASTED_IMAGES: usize = 50;
+
+/// A copied image file larger than this is not pasted.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PASTED_IMAGE_BYTES: u64 = 256 << 20;
+
+/// The file at `path`, or `None` when it holds more than `cap` bytes.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_capped(path: &std::path::Path, cap: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?.take(cap.saturating_add(1)).read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= cap).then_some(bytes))
+}
+
+/// What ⌘V places from the system clipboard: its copied files when it has any, else its picture.
+/// Finder puts a copied file's icon beside it as a picture, so the files come first, and the
+/// picture isn't read at all then.
+#[cfg(not(target_arch = "wasm32"))]
+fn clipboard_picture(files: Vec<std::path::PathBuf>, picture: impl FnOnce() -> Option<crate::create_ui::Clip>) -> Option<crate::create_ui::Clip> {
+    if files.is_empty() { picture() } else { Some(crate::create_ui::Clip::Files(files)) }
+}
+
+/// The image files Add Image offers, by extension.
+#[cfg(not(target_arch = "wasm32"))]
+const IMAGE_EXTENSIONS: [&str; 10] = ["png", "jpg", "jpeg", "tif", "tiff", "gif", "bmp", "jp2", "j2k", "jpx"];
+
+/// Whether `path` names an image file Add Image takes, by its extension (any case).
+#[cfg(not(target_arch = "wasm32"))]
+fn is_image_file_name(path: &std::path::Path) -> bool {
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| e.eq_ignore_ascii_case(x)))
 }
 
 /// What the image tools ask for.
@@ -932,6 +1015,29 @@ mod tests {
     use egui_kittest::kittest::Queryable;
 
     use super::*;
+
+    /// Copied files win over the picture beside them (Finder's icon of the file), which then
+    /// isn't read at all.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn copied_files_come_before_the_clipboard_picture() {
+        use crate::create_ui::Clip;
+        let files = vec![std::path::PathBuf::from("/tmp/a.png")];
+        let unread = || -> Option<Clip> { panic!("the picture is read only without files") };
+        assert_eq!(clipboard_picture(files.clone(), unread), Some(Clip::Files(files)));
+        let icon = Clip::Image { width: 1, height: 1, rgba: vec![0; 4] };
+        assert_eq!(clipboard_picture(Vec::new(), || Some(icon.clone())), Some(icon));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_pasted_file_over_the_cap_is_not_read_whole() {
+        let path = std::env::temp_dir().join(format!("pdfcraft-read-capped-{}", std::process::id()));
+        std::fs::write(&path, [7u8; 10]).unwrap();
+        assert_eq!(read_capped(&path, 10).unwrap(), Some(vec![7u8; 10]));
+        assert_eq!(read_capped(&path, 9).unwrap(), None);
+        std::fs::remove_file(&path).unwrap();
+    }
 
     /// The image a flip button leaves behind, as the panel returns it.
     fn flipped(tooltip: &str) -> pdfcraft_engine::AddedImage {
