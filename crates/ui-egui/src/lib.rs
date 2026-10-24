@@ -2971,6 +2971,8 @@ impl PdfCraftApp {
         Ok(())
     }
 
+    /// The window's keyboard shortcuts for this frame: modal prompts first, then the registry's
+    /// commands, then ⌘V's pastes (copied files on Home, pictures on a page) and the canvas keys.
     fn shortcuts(&mut self, ctx: &egui::Context) {
         use egui::Key;
         let pasted = self.paste_key_released(ctx);
