@@ -367,6 +367,16 @@ fn image_files_on_the_clipboard_are_pasted_onto_the_page() {
         h.state_mut().clipboard_override = Some(Clip::Files(files.iter().map(|f| dir.join(f)).collect()));
         h.event(egui::Event::Key { key: egui::Key::V, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::COMMAND });
         h.run_steps(3);
+        // The files are read on a worker thread and placed on a later frame.
+        for _ in 0..500 {
+            if !h.state().paste_reading() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            h.run_steps(1);
+        }
+        assert!(!h.state().paste_reading(), "the copied files were read");
+        h.run_steps(2);
     };
     let toast = |h: &Harness<'static, PdfCraftApp>| h.state().toast.as_ref().map(|(t, _)| t.clone()).unwrap_or_default();
     // A PDF and a folder (even one named like a picture) are not pictures for the page.
