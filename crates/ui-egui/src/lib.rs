@@ -3002,6 +3002,8 @@ impl PdfCraftApp {
             return;
         }
         self.registry_shortcuts(ctx);
+        #[cfg(not(target_arch = "wasm32"))]
+        let pasted = pasted && !self.paste_files_key(ctx, pasted);
         // (Esc closes a Combine file shown large first.)
         if self.full_screen && self.combine_tab.preview.is_none() && ctx.input(|i| i.key_pressed(Key::Escape)) {
             self.set_full_screen(ctx, false);
