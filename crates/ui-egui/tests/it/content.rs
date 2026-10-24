@@ -399,10 +399,37 @@ fn image_files_on_the_clipboard_are_pasted_onto_the_page() {
     assert_eq!(h.state().views[0].content.selected, Some((0, 0)));
     // Two at once: both placed, the last one selected.
     paste(&mut h, &["Copied.PNG", "second.png"]);
+    // A document that doesn't allow changes says so, once, and that isn't hidden by the notice
+    // for a paste with no pictures.
+    {
+        let app = h.state_mut();
+        let protected = app.session.create_from_text("restricted", "no changes").unwrap();
+        app.open_bytes("restricted.pdf", None, protected.to_vec()).unwrap();
+        let id = app.views[1].id;
+        app.session
+            .apply(
+                id,
+                pdfcraft_engine::Edit::Protect(pdfcraft_engine::Protection {
+                    permissions_password: Some("owner".into()),
+                    changes: pdfcraft_engine::Changes::None,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let bytes = app.session.save_bytes(id).unwrap();
+        app.open_bytes("restricted-saved.pdf", None, bytes.as_ref().clone()).unwrap();
+    }
+    h.run_steps(3);
+    let restricted = h.state().views[2].id;
+    assert!(!h.state().session.get(restricted).unwrap().allows_modification());
+    paste(&mut h, &["Copied.PNG", "second.png"]);
+    assert!(h.state().session.get(restricted).unwrap().added().is_empty());
+    assert!(!toast(&h).is_empty() && !toast(&h).starts_with("None of the copied files"), "{}", toast(&h));
+    h.state_mut().active = Some(0);
+    h.run_steps(2);
     std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(added(&h).len(), 3, "{}", toast(&h));
     assert_eq!(h.state().views[0].content.selected, Some((0, 2)));
-    assert_eq!(h.state().views.len(), 1);
 }
 
 /// #125: text the standard fonts can't draw stays in the editor with a warning instead of being

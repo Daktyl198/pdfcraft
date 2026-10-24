@@ -901,14 +901,8 @@ impl crate::PdfCraftApp {
         self.paste_reads.reading += 1;
         let started = std::thread::Builder::new().name("paste-images".into()).spawn(move || {
             // Folders called like pictures are skipped, as other files that aren't pictures are.
-            let files = pictures
-                .into_iter()
-                .filter(|p| !p.is_dir())
-                .map(|p| {
-                    let read = read_capped(&p, MAX_PASTED_IMAGE_BYTES).map_err(|e| e.to_string());
-                    (p, read)
-                })
-                .collect();
+            let pictures = pictures.into_iter().filter(|p| !p.is_dir());
+            let files = read_within(pictures, MAX_PASTED_IMAGE_BYTES, MAX_PASTE_BYTES, read_capped);
             done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(PasteRead { target, files });
             if let Some(ctx) = ctx {
                 ctx.request_repaint();
@@ -939,33 +933,34 @@ impl crate::PdfCraftApp {
                 self.notify_tr("The document changed while the copied files were read, so nothing was pasted.");
                 continue;
             }
-            let (mut placed, mut failed) = (0usize, false);
+            // Only folders called like pictures were copied: nothing else would say why nothing
+            // was placed. Each file read is placed, or its own notice (or the document's
+            // refusal) says why not.
+            if files.is_empty() {
+                self.notify_tr(NO_PICTURE);
+                continue;
+            }
             for (path, read) in files {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 match read {
-                    Ok(Some(bytes)) => {
+                    FileRead::Bytes(bytes) => {
                         // A document that can't take it says so once, not once per file.
                         if !self.add_image_on(target.page, name, bytes) {
                             break;
                         }
-                        placed += 1;
                     }
-                    Ok(None) => {
-                        failed = true;
-                        self.notify_fmt(
-                            "{name} is too large to paste (at most {n} MB)",
-                            &[("name", &name), ("n", &(MAX_PASTED_IMAGE_BYTES >> 20).to_string())],
-                        );
-                    }
-                    Err(e) => {
-                        failed = true;
+                    FileRead::TooLarge => self.notify_fmt(
+                        "{name} is too large to paste (at most {n} MB)",
+                        &[("name", &name), ("n", &(MAX_PASTED_IMAGE_BYTES >> 20).to_string())],
+                    ),
+                    FileRead::OverTotal => self.notify_fmt(
+                        "{name} wasn't pasted: the copied files together are over {n} MB",
+                        &[("name", &name), ("n", &(MAX_PASTE_BYTES >> 20).to_string())],
+                    ),
+                    FileRead::Failed(e) => {
                         self.notify_fmt("Couldn't read {name}: {e}", &[("name", &path.display().to_string()), ("e", &e)]);
                     }
                 }
-            }
-            // A file that couldn't be read has said so; this notice would hide it.
-            if placed == 0 && !failed {
-                self.notify_tr(NO_PICTURE);
             }
         }
     }
@@ -993,9 +988,47 @@ struct PasteTarget {
     generation: Option<u64>,
 }
 
-/// One copied file as read: its bytes, `None` when over the cap, or why it couldn't be read.
+/// One copied file as read.
 #[cfg(not(target_arch = "wasm32"))]
-type FileRead = Result<Option<Vec<u8>>, String>;
+#[derive(Debug, PartialEq)]
+enum FileRead {
+    Bytes(Vec<u8>),
+    /// Over the cap for one file.
+    TooLarge,
+    /// Over what the files read before it left of the cap for the whole paste.
+    OverTotal,
+    /// Why it couldn't be read.
+    Failed(String),
+}
+
+/// Read each of `paths` with `read`, at most `per_file` bytes each and `total` bytes for all
+/// of them, so a paste never holds more than `total` bytes of files waiting to be placed.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_within(
+    paths: impl IntoIterator<Item = std::path::PathBuf>,
+    per_file: u64,
+    total: u64,
+    mut read: impl FnMut(&std::path::Path, u64) -> std::io::Result<Option<Vec<u8>>>,
+) -> Vec<(std::path::PathBuf, FileRead)> {
+    let mut left = total;
+    paths
+        .into_iter()
+        .map(|path| {
+            let cap = per_file.min(left);
+            let result = match read(&path, cap) {
+                Ok(Some(bytes)) => {
+                    left = left.saturating_sub(bytes.len() as u64);
+                    FileRead::Bytes(bytes)
+                }
+                // Over what the paste had left: that is the cap it ran into.
+                Ok(None) if cap < per_file => FileRead::OverTotal,
+                Ok(None) => FileRead::TooLarge,
+                Err(e) => FileRead::Failed(e.to_string()),
+            };
+            (path, result)
+        })
+        .collect()
+}
 
 /// Copied image files read for one paste.
 #[cfg(not(target_arch = "wasm32"))]
@@ -1012,6 +1045,10 @@ const MAX_PASTED_IMAGES: usize = 50;
 /// A copied image file larger than this is not pasted.
 #[cfg(not(target_arch = "wasm32"))]
 const MAX_PASTED_IMAGE_BYTES: u64 = 256 << 20;
+
+/// The copied image files of one paste together are not read past this.
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_PASTE_BYTES: u64 = 512 << 20;
 
 /// The regular file at `path`, or `None` when it holds more than `cap` bytes. Anything else
 /// (a named pipe or a device, which a file list can name too) is refused before it is read,
@@ -1148,6 +1185,25 @@ mod tests {
         assert_eq!(clipboard_picture(files.clone(), unread), Some(Clip::Files(files)));
         let icon = Clip::Image { width: 1, height: 1, rgba: vec![0; 4] };
         assert_eq!(clipboard_picture(Vec::new(), || Some(icon.clone())), Some(icon));
+    }
+
+    /// The files of one paste share a cap: once it is spent, the rest aren't read whole, and say
+    /// which cap they were over.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_paste_reads_its_files_within_one_total() {
+        let sizes = [("b.png", 20usize), ("a.png", 6), ("c.png", 3), ("d.png", 5), ("e.png", 1)];
+        let read = |p: &std::path::Path, cap: u64| -> std::io::Result<Option<Vec<u8>>> {
+            let name = p.to_string_lossy();
+            let size = sizes.iter().find(|(n, _)| name.ends_with(n)).map_or(0, |(_, s)| *s);
+            Ok((size as u64 <= cap).then(|| vec![0; size]))
+        };
+        let paths = sizes.iter().map(|(n, _)| std::path::PathBuf::from(format!("/tmp/{n}")));
+        let got: Vec<_> = read_within(paths, 10, 12, read).into_iter().map(|(_, r)| r).collect();
+        assert_eq!(
+            got,
+            [FileRead::TooLarge, FileRead::Bytes(vec![0; 6]), FileRead::Bytes(vec![0; 3]), FileRead::OverTotal, FileRead::Bytes(vec![0; 1])]
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
